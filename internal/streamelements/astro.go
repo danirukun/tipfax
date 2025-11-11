@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"strings"
 
 	"github.com/DaniruKun/tipfax/internal/config"
 	"github.com/google/uuid"
@@ -49,9 +50,21 @@ func (a *Astro) Connect() error {
 }
 
 func (a *Astro) SubscribeTips() error {
+	// Validate token
+	if a.cfg.SeJWTToken == "" {
+		return fmt.Errorf("SE_JWT_TOKEN is empty or not set")
+	}
+
+	// Basic JWT validation (should have 3 parts separated by dots)
+	parts := len(a.cfg.SeJWTToken)
+	if parts < 50 {
+		log.Printf("⚠️  Warning: JWT token seems unusually short (%d chars). This might be invalid.", parts)
+	}
+
+	nonce := uuid.New().String()
 	subscribeMessage := map[string]any{
 		"type":  "subscribe",
-		"nonce": uuid.New().String(),
+		"nonce": nonce,
 		"data": map[string]any{
 			"topic":      TipsTopic,
 			"token":      a.cfg.SeJWTToken,
@@ -59,12 +72,21 @@ func (a *Astro) SubscribeTips() error {
 		},
 	}
 
+	// Log subscription attempt (mask token for security)
+	tokenPreview := a.cfg.SeJWTToken
+	if len(tokenPreview) > 20 {
+		tokenPreview = tokenPreview[:10] + "..." + tokenPreview[len(tokenPreview)-10:]
+	}
+	log.Printf("Subscribing to topic '%s' with nonce '%s' (token length: %d, preview: %s)",
+		TipsTopic, nonce, len(a.cfg.SeJWTToken), tokenPreview)
+	log.Printf("Subscription message: type=%s, nonce=%s, topic=%s", subscribeMessage["type"], nonce, TipsTopic)
+
 	if err := a.conn.WriteJSON(subscribeMessage); err != nil {
-		log.Println("Error subscribing:", err)
+		log.Printf("Error sending subscription message: %v", err)
 		return err
 	}
 
-	log.Println("Subscribed to Astro topic:", TipsTopic)
+	log.Println("Subscription message sent, waiting for response...")
 
 	return nil
 }
@@ -82,14 +104,97 @@ func (a *Astro) Listen() error {
 
 		// Handle different message types
 		switch msg.Type {
+		case "welcome":
+			if welcomeData, ok := msg.Data.(map[string]any); ok {
+				if clientID, ok := welcomeData["client_id"].(string); ok {
+					log.Printf("✅ Connected to Astro (client_id: %s)", clientID)
+				}
+				if welcomeMsg, ok := welcomeData["message"].(string); ok {
+					log.Printf("   %s", welcomeMsg)
+				}
+			}
 		case "response":
-			log.Println("Received response:", msg)
+			log.Printf("Received response: Type=%s, Nonce=%s", msg.Type, msg.Nonce)
+
+			// Parse response data
+			if responseData, ok := msg.Data.(map[string]any); ok {
+				responseMsg, hasMessage := responseData["message"].(string)
+
+				// Check if this is an error or success
+				isError := false
+				if hasMessage {
+					// Convert to lowercase for case-insensitive matching
+					lowerMsg := strings.ToLower(responseMsg)
+
+					// Check for success indicators first
+					successKeywords := []string{"success", "subscribed"}
+					hasSuccess := false
+					for _, keyword := range successKeywords {
+						if strings.Contains(lowerMsg, keyword) {
+							hasSuccess = true
+							break
+						}
+					}
+
+					// If not a success message, check for error indicators
+					if !hasSuccess {
+						errorKeywords := []string{"error", "failed", "invalid", "unauthorized", "forbidden", "not found"}
+						for _, keyword := range errorKeywords {
+							if strings.Contains(lowerMsg, keyword) {
+								isError = true
+								break
+							}
+						}
+					}
+
+					// Also check for error code or error type fields
+					if _, hasErrorCode := responseData["code"]; hasErrorCode {
+						isError = true
+					}
+					if errorType, ok := responseData["type"].(string); ok {
+						if errorType == "error" {
+							isError = true
+						}
+					}
+				}
+
+				if isError {
+					log.Printf("❌ Error response: %s", responseMsg)
+					// Check for additional error details
+					if errorCode, ok := responseData["code"].(string); ok {
+						log.Printf("   Error code: %s", errorCode)
+					}
+					if errorType, ok := responseData["type"].(string); ok {
+						log.Printf("   Error type: %s", errorType)
+					}
+					log.Printf("   Full response data: %+v", responseData)
+				} else {
+					// Success response
+					if hasMessage {
+						log.Printf("✅ %s", responseMsg)
+					} else {
+						log.Printf("✅ Success response: %+v", responseData)
+					}
+
+					// Log topic info if present
+					if topic, ok := responseData["topic"].(string); ok {
+						log.Printf("   Topic: %s", topic)
+					}
+					if room, ok := responseData["room"].(string); ok {
+						log.Printf("   Room: %s", room)
+					}
+				}
+			} else {
+				log.Printf("Response data (raw): %+v", msg.Data)
+			}
 		case "message":
 			log.Println("Received notification:", msg)
 			// Process the notification based on the topic
 			if msg.Topic == TipsTopic {
 				a.handleTipMessage(msg)
 			}
+		default:
+			log.Printf("Received unknown message type '%s': %+v", msg.Type, msg)
 		}
 	}
 }
